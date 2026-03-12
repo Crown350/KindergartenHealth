@@ -1,0 +1,6 @@
+pandas
+matplotlib
+tkcalendar
+Pillow
+reportlab
+openpyxl
