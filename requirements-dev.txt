@@ -1,0 +1,5 @@
+# Packaging/development-only dependencies. NOT part of the runtime requirements
+# (requirements.txt); these are only needed to build the Windows executable.
+#
+# Verified in the project .venv (Python 3.12).
+pyinstaller==6.22.3

@@ -1,6 +1,13 @@
-pandas
-matplotlib
-tkcalendar
-Pillow
-reportlab
-openpyxl
+# Direct runtime dependencies ONLY (verified in the project .venv, Python 3.12).
+# Transitive dependencies are intentionally NOT pinned here: install with
+# `pip install -r requirements.txt` and let pip resolve the rest.
+#
+# Note: tkcalendar's importable `__version__` string reports 1.5.0, but the
+# installed distribution (pip metadata) is 1.6.1; the pinned value below is
+# the installed distribution version.
+pandas==3.0.6
+matplotlib==3.11.2
+tkcalendar==1.6.1
+Pillow==12.3.0
+reportlab==5.0.1
+openpyxl==3.1.5

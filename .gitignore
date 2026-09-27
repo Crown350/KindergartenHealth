@@ -3,6 +3,24 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# --- Project runtime data (generated / private) ------------------------------
+# Everything the application WRITES at runtime lives under .runtime/ and must
+# never enter version control. Verified with `git check-ignore -v <path>`.
+.runtime/
+# SQLite databases, including the WAL/SHM sidecars of the default journal mode.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+# Child photos and generated backups.
+photos/
+backups/
+# Generated exports and reports.
+*.pdf
+*.xlsx
+# Serena agent cache/memories.
+.serena/
+
 # C extensions
 *.so
 
@@ -30,7 +48,12 @@ MANIFEST
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
-*.spec
+# The project ships a tracked KindergartenHealth.spec as its build definition;
+# only temporary/backup spec artifacts are ignored here.
+*.spec~
+*.spec.bak
+*.spec.orig
+*.spec.rej
 
 # Installer logs
 pip-log.txt

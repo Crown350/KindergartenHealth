@@ -1,16 +1,16 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import pandas as pd
-from datetime import datetime
-import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from tkcalendar import DateEntry
 from PIL import Image, ImageTk
 import os
-import shutil
 import sys
 
-from database import Database
+from database import Database, ALL_GROUPS, group_filter_choices
+import paths
+import photos
+import charts
+import exporters
 
 # --- Configuration & Constants ---
 COLORS = {
@@ -65,6 +65,12 @@ class KindergartenApp:
         except Exception as e:
             messagebox.showerror("Fatal Error", f"Database connection failed:\n{e}")
             sys.exit(1)
+
+        # Structured rows backing the sidebar and the Excel export (never the
+        # Treeview's stringified value cache) and the single statistics figure
+        # the app owns at a time.
+        self._rows = []
+        self._stats_fig = None
 
         self.setup_styles()
         self.create_main_layout()
@@ -160,10 +166,11 @@ class KindergartenApp:
 
         # Filter
         ttk.Label(toolbar, text="Группа:", style="Body.TLabel").pack(anchor=tk.W, pady=(10, 0))
-        self.group_filter_var = tk.StringVar(value="Все")
+        self.group_filter_var = tk.StringVar(value=ALL_GROUPS)
         self.group_combo = ttk.Combobox(toolbar, textvariable=self.group_filter_var, state="readonly")
         self.group_combo.pack(fill=tk.X, pady=5)
         self.group_combo.bind("<<ComboboxSelected>>", lambda e: self.load_data())
+        self._refresh_group_choices()
 
         # Action Buttons
         actions = ttk.Frame(toolbar, style="Card.TFrame")
@@ -201,10 +208,26 @@ class KindergartenApp:
 
         self.tree.bind("<<TreeviewSelect>>", self.on_child_select)
 
+    def _refresh_group_choices(self):
+        """Rebuild the sidebar group-combo from the database.
+
+        Keeps the current selection when it is still a valid choice (including
+        the canonical ALL_GROUPS sentinel), otherwise falls back to
+        ALL_GROUPS so the list can never end up filtered by a vanished group.
+        """
+        current = self.group_filter_var.get()
+        choices = group_filter_choices(self.db.get_groups())
+        self.group_combo['values'] = choices
+        self.group_filter_var.set(current if current in choices else ALL_GROUPS)
+
     # --- Views ---
     def clear_right_panel(self):
         for widget in self.right_panel.winfo_children():
             widget.destroy()
+        # The destroyed canvas no longer owns the figure; release it so the
+        # app keeps at most one statistics figure at any time.
+        charts.close_figure(self._stats_fig)
+        self._stats_fig = None
 
     def show_welcome_view(self):
         self.clear_right_panel()
@@ -226,6 +249,7 @@ class KindergartenApp:
             name = new_group_entry.get()
             if name and self.db.add_group(name):
                 messagebox.showinfo("Успех", "Группа добавлена")
+                self._refresh_group_choices()
                 self.load_data()
                 self.show_manage_groups_view()
             else:
@@ -252,6 +276,7 @@ class KindergartenApp:
     def _update_group(self, gid, name):
         if self.db.update_group(gid, name):
             messagebox.showinfo("Успех", "Обновлено")
+            self._refresh_group_choices()
             self.load_data()
         else:
             messagebox.showerror("Ошибка", "Не удалось обновить")
@@ -259,6 +284,7 @@ class KindergartenApp:
     def _delete_group(self, gid):
         if messagebox.askyesno("Подтверждение", "Удалить группу?"):
             if self.db.delete_group(gid):
+                self._refresh_group_choices()
                 self.show_manage_groups_view()
                 self.load_data()
             else:
@@ -373,24 +399,68 @@ class KindergartenApp:
                 messagebox.showwarning("Внимание", "Заполните обязательные поля (ФИО, ДР, Группа)")
                 return
 
-            # Handle photo file
-            final_photo = data['photo']
-            if final_photo and os.path.exists(final_photo) and "photos" not in final_photo:
-                if not os.path.exists("photos"): os.makedirs("photos")
-                filename = f"{data['name']}_{datetime.now().timestamp()}.jpg"
-                dest = os.path.join("photos", filename)
-                try:
-                    shutil.copy(final_photo, dest)
-                    final_photo = dest
-                except Exception: pass
+            chosen = data['photo']
 
             if child:
-                self.db.update_child(child['id'], data['name'], data['dob'], g_dict[data['group']], final_photo, data['allergies'])
+                old_photo = child['photo_path'] or None
+                # Import the chosen file into the managed directory FIRST; the
+                # previous photo is only released after the DB update succeeds.
+                imported = None
+                if chosen and not photos.is_within(chosen):
+                    imported = photos.import_photo(chosen, child['id'])
+                    if imported is None:
+                        messagebox.showwarning("Внимание", "Фото не сохранено: файл не поддерживается или недоступен.")
+
+                if imported is not None:
+                    final_photo = imported
+                elif chosen and photos.is_within(chosen):
+                    final_photo = chosen          # already managed, store as-is
+                elif chosen:
+                    final_photo = old_photo       # import failed, keep previous photo
+                else:
+                    final_photo = chosen          # empty -> clear the photo
+
+                def commit_photo(path):
+                    self.db.update_child(child['id'], data['name'], data['dob'],
+                                         g_dict[data['group']], path, data['allergies'])
+                    return True
+
+                if not photos.commit_photo_update(old_photo, final_photo, imported, commit_photo):
+                    messagebox.showerror("Ошибка", "Не удалось сохранить данные")
+                    return
                 messagebox.showinfo("Успех", "Данные обновлены")
                 self.load_data()
                 self.show_child_details(child['id'])
             else:
-                new_id = self.db.add_child(data['name'], data['dob'], g_dict[data['group']], final_photo, data['allergies'])
+                # Insert the row first so a failed insert can never orphan a
+                # photo, and so the photo is named with the real child id.
+                try:
+                    new_id = self.db.add_child(data['name'], data['dob'],
+                                               g_dict[data['group']], None, data['allergies'])
+                except Exception as e:
+                    messagebox.showerror("Ошибка", str(e))
+                    return
+
+                imported = None
+                if chosen and not photos.is_within(chosen):
+                    imported = photos.import_photo(chosen, new_id)
+                    if imported is None:
+                        messagebox.showwarning("Внимание", "Фото не сохранено: файл не поддерживается или недоступен.")
+
+                if imported is not None:
+                    stored = imported
+                elif chosen and photos.is_within(chosen):
+                    stored = chosen              # already managed, link as-is
+                else:
+                    stored = None               # nothing importable to attach
+
+                def commit_new_photo(path):
+                    self.db.update_child(new_id, data['name'], data['dob'],
+                                         g_dict[data['group']], path, data['allergies'])
+                    return True
+
+                if stored and not photos.commit_photo_update(None, stored, imported, commit_new_photo):
+                    messagebox.showerror("Ошибка", "Не удалось сохранить фото")
                 messagebox.showinfo("Успех", "Ребёнок добавлен")
                 self.load_data()
                 self.show_child_details(new_id)
@@ -419,24 +489,12 @@ class KindergartenApp:
                 ttk.Label(r_frame, text=f"• {r}", style="Body.TLabel").pack(anchor=tk.W, padx=20)
         
         stats = self.db.get_dashboard_stats()
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4), facecolor="white")
-        
-        # Bar Chart
-        if stats['children_per_group']:
-            groups = [x[0] for x in stats['children_per_group']]
-            counts = [x[1] for x in stats['children_per_group']]
-            ax1.bar(groups, counts, color=COLORS["primary"])
-            ax1.set_title("Дети по группам")
-            plt.setp(ax1.get_xticklabels(), rotation=30, ha="right")
-        
-        # Pie Chart
-        if stats['top_diagnoses']:
-            diags = [x[0] for x in stats['top_diagnoses']]
-            d_counts = [x[1] for x in stats['top_diagnoses']]
-            ax2.pie(d_counts, labels=diags, autopct='%1.1f%%', colors=[COLORS["primary"], COLORS["secondary"], COLORS["accent"], "#9B59B6", "#34495E"])
-            ax2.set_title("Частые диагнозы")
-        
+
+        # clear_right_panel() already released any previous figure, so the app
+        # owns at most one statistics figure at a time.
+        fig = charts.build_stats_figure(stats, COLORS)
+        self._stats_fig = fig
+
         canvas = FigureCanvasTkAgg(fig, master=self.right_panel)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -455,10 +513,16 @@ class KindergartenApp:
         header = ttk.Frame(self.right_panel, style="Card.TFrame")
         header.pack(fill=tk.X, pady=(0, 20))
         
-        # Photo
-        if child['photo_path'] and os.path.exists(child['photo_path']):
+        # Photo. Stored photo paths are RELATIVE to the runtime root (or
+        # absolute when the user re-selected an already-managed file), so
+        # resolve relatives against paths.PROJECT_ROOT rather than the process
+        # CWD: a packaged build is not launched from its data directory.
+        photo_path = child['photo_path']
+        if photo_path and not os.path.isabs(photo_path):
+            photo_path = os.path.join(paths.PROJECT_ROOT, photo_path)
+        if photo_path and os.path.exists(photo_path):
             try:
-                img = Image.open(child['photo_path']).resize((100, 100), Image.Resampling.LANCZOS)
+                img = Image.open(photo_path).resize((100, 100), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 lbl = ttk.Label(header, image=photo)
                 lbl.image = photo
@@ -655,30 +719,58 @@ class KindergartenApp:
         ttk.Label(frame, textvariable=res_var, font=("Segoe UI", 24, "bold"), background="white").pack(side=tk.RIGHT, padx=50)
 
     def backup_database(self):
-        path = filedialog.asksaveasfilename(defaultextension=".db", filetypes=[("Database", "*.db")])
-        if path:
-            if self.db.backup_db(path): messagebox.showinfo("Успех", "Резервная копия создана")
-            else: messagebox.showerror("Ошибка", "Не удалось создать копию")
+        # Backups default into the ignored runtime backups directory, but the
+        # user is free to navigate anywhere; the destination directory must
+        # already exist for the atomic copy to succeed.
+        try:
+            os.makedirs(paths.BACKUPS_DIR, exist_ok=True)
+            initial_dir = paths.BACKUPS_DIR
+        except OSError:
+            initial_dir = None
+        path = filedialog.asksaveasfilename(
+            defaultextension=".db",
+            filetypes=[("Database", "*.db")],
+            initialdir=initial_dir,
+        )
+        if not path:
+            return
+        # The file dialog may not ask (or may not be able to ask, depending on
+        # the platform), so confirm an overwrite here too before the atomic
+        # swap replaces the user's previous backup.
+        if os.path.exists(path) and not messagebox.askyesno(
+            "Перезаписать?",
+            "Файл уже существует:\n{}\nПерезаписать его?".format(path),
+        ):
+            return
+        if self.db.backup_db(path): messagebox.showinfo("Успех", "Резервная копия создана")
+        else: messagebox.showerror("Ошибка", "Не удалось создать копию")
 
     def load_data(self):
         for item in self.tree.get_children(): self.tree.delete(item)
         data = self.db.get_children_summary(self.search_var.get(), self.group_filter_var.get())
+        # Keep the STRUCTURED rows for the Excel export; the Treeview only ever
+        # holds their stringified display copy.
+        self._rows = list(data)
         for row in data:
             self.tree.insert("", tk.END, values=(row['id'], row['full_name'], row['group_name']))
 
     def reset_filters(self):
         self.search_var.set("")
-        self.group_filter_var.set("Все")
+        self.group_filter_var.set(ALL_GROUPS)
         self.load_data()
 
     def export_to_excel(self):
         path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
-        if path:
-            data = [self.tree.item(i, "values") for i in self.tree.get_children()]
-            try:
-                pd.DataFrame(data, columns=["ID", "ФИО", "Группа"]).to_excel(path, index=False)
-                messagebox.showinfo("Успех", "Файл сохранен")
-            except Exception as e: messagebox.showerror("Ошибка", str(e))
+        if not path:
+            return
+        try:
+            # Built from the structured DB rows, never the Treeview's string
+            # cache: the ID stays numeric and user-controlled text cannot be
+            # parsed as a spreadsheet formula.
+            exporters.children_to_dataframe(self._rows).to_excel(path, index=False)
+            messagebox.showinfo("Успех", "Файл сохранен")
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
 
 if __name__ == "__main__":
     root = tk.Tk()

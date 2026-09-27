@@ -1,3 +1,4 @@
+import argparse
 import random
 from datetime import datetime, timedelta
 from database import Database
@@ -35,8 +36,15 @@ def random_recent_date(days=365):
     delta = end - start
     return (start + timedelta(days=random.randrange(delta.days))).strftime("%Y-%m-%d")
 
-def seed_database():
-    db = Database()
+def seed_database(db_path=None):
+    """Seed ``db_path`` (the runtime database by default) with synthetic data.
+
+    ``db_path=None`` uses ``Database``'s default, i.e. the centralized runtime
+    database; passing an explicit path is what ``--db`` and the tests do. No
+    database is ever created or copied implicitly: an existing file is cleared
+    in place and a missing file is created fresh by ``Database.__init__``.
+    """
+    db = Database(db_path)
     
     print("Clearing old data...")
     # Order matters due to FKs
@@ -107,7 +115,22 @@ def seed_database():
         db.mark_attendance(cid, date, status)
 
     db.close()
-    print("Database seeded successfully!")
+    print(f"Database seeded successfully: {db.db_file}")
+
+
+def _parse_args(argv=None):
+    """Parse the seeder's command line (a thin wrapper around seed_database)."""
+    parser = argparse.ArgumentParser(
+        description="Seed the kindergarten database with synthetic demo data.",
+    )
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="Target database path (default: the application runtime database).",
+    )
+    return parser.parse_args(argv)
+
 
 if __name__ == "__main__":
-    seed_database()
+    args = _parse_args()
+    seed_database(args.db)
