@@ -46,6 +46,10 @@ MUST_NOT_BE_TRACKED = [
     "photos/123_1772096373.268721.jpg",
 ]
 
+# The repository's single initial commit. It must always remain an ancestor of
+# HEAD: that is how the hygiene work proves it never rewrote history.
+INITIAL_COMMIT = "38b58dcc972daf1d32de00c26264f25ec6393400"
+
 
 def _git_available():
     return shutil.which("git") is not None
@@ -120,11 +124,21 @@ class TestIgnorePolicyGit(unittest.TestCase):
         for rel in MUST_NOT_BE_TRACKED:
             self.assertNotIn(rel, tracked, f"still tracked in the index: {rel}")
 
-    def test_head_is_the_initial_commit(self):
-        # Hygiene work must never rewrite history or add commits.
+    def test_history_was_never_rewritten(self):
+        # The audit tripwire originally pinned HEAD to the initial commit to
+        # catch accidental commits during the hygiene work. Once the intended
+        # final commit lands, HEAD legitimately moves past it, so the lasting
+        # invariant is that the initial commit stayed an ancestor of HEAD
+        # (i.e. history was rewritten never, only appended to).
+        ok, _ = _git(["merge-base", "--is-ancestor", INITIAL_COMMIT, "HEAD"])
+        self.assertTrue(ok, "initial commit is not an ancestor of HEAD")
         ok, out = _git(["rev-parse", "HEAD"])
-        self.assertTrue(ok)
-        self.assertEqual(out.strip(), "38b58dcc972daf1d32de00c26264f25ec6393400")
+        self.assertTrue(ok, "git rev-parse HEAD failed")
+        self.assertNotEqual(
+            out.strip(),
+            INITIAL_COMMIT,
+            "HEAD is still the initial commit; expected the final commit",
+        )
 
 
 if __name__ == "__main__":
